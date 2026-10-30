@@ -1,150 +1,181 @@
-# noteql — design doc
+# noteql
 
 ## what it is
 
-noteql is a local-first retrieval and query engine for personal notes.
-it reads notes from wherever i keep them (starting with an obsidian
-vault of markdown files), builds its own storage and index, and lets
-me ask questions about my own past thinking — across sources, across
-time, across courses — and get back either a ranked list of relevant
-notes or an llm-generated answer grounded in those notes with
-citations.
+noteql is a search engine over my notes from every app i keep them in.
+it pulls notes from obsidian (via github), notion, onedrive, and google
+drive into one cloud database, figures out when the same note lives in
+more than one app, and lets me search all of it from a search page on
+my notes website.
 
-it exists because my notes are fragmented across obsidian, notion,
-and onenote, and no existing tool lets me ask "how did my linear
-algebra professor explain matrix multiplication years ago" and get
-a useful answer. the tools that can search each silo don't understand
-structure (which class, when written, what it links to). the tools
-that could reason across everything (chatgpt, etc.) don't have access
-to my notes and don't cite. noteql is the thing in the middle.
+it exists because my notes are fragmented. a class note might start as
+a word doc in onedrive, get copied into notion, then get rewritten in
+obsidian. searching any one app gives me a partial or outdated view,
+and nothing tells me which copy is the current one.
 
-## the core
+## principles
 
-the interesting engineering in personal-knowledge tools is not the
-llm layer — it's the retrieval layer underneath. everyone is calling
-the same models. what differentiates a useful personal agent from a
-generic chatbot is *what context gets retrieved and how*. most
-projects in this space treat retrieval as "call a vector db, hope
-for the best." noteql treats retrieval as a real systems problem:
-custom storage, from-scratch inverted index, structure-aware
-ranking, and a query layer richer than similarity search.
+- **notes stay where they are.** the database holds a searchable copy;
+  nothing is moved or edited in the source apps.
+- **cross-app matching is the core**, not an add-on.
+- **everything is public** (tentatively). they're just notes, so no
+  login.
+
+## differentiator
+
+it knows when the same note lives in several apps, groups the copies,
+and shows the newest one.
+
+search across apps already exists. duplicate finders already exist,
+but each works inside a single app (drive, onedrive, notion, obsidian
+each have their own). i haven't found anything that matches copies
+*across* apps.
 
 ## final product shape
 
-two thin interfaces on top of one real engine:
+```
+github (obsidian)  notion  onedrive  google drive
+        \            |        |          /
+         sync jobs (only process what changed)
+                        ↓
+          normalize into relational schema
+                        ↓
+          match copies of the same note
+                        ↓
+               cloud postgres
+                        ↓
+   search page on notes website  +  mcp server (later)
+```
 
-1. a search interface: type a query, get a ranked list of matching
-   notes with snippets. for browsing and reading.
-2. a question-answering interface: ask a natural-language question,
-   get an llm-generated answer grounded in retrieved notes, with
-   citations back to the sources. for synthesis.
+1. **search page** on my notes website: type a query, get ranked notes
+   with snippets, see every app each note lives in, newest copy first.
+2. **mcp server** (later): claude can search my notes directly.
 
-the retrieval engine underneath is the actual product. the two
-interfaces are how i demonstrate that good retrieval infrastructure
-serves both traditional search and agentic use cases.
+## schema (draft)
 
-the engine is ui-agnostic. cli and web ui are thin clients over the
-same engine api — same functions, different frontends. sequencing:
+```sql
+sources (
+  id          SERIAL PRIMARY KEY,
+  app         TEXT,        -- 'github', 'notion', 'onedrive', 'gdrive'
+  account     TEXT,        -- 'personal', 'school'
+  folder      TEXT,        -- only sync this folder, not the whole account
+  visibility  TEXT DEFAULT 'public'
+);
 
-- v0–v2 (engine era): cli only. no ui work while retrieval is
-  being built.
-- v3–v4 (interfaces era): local web ui served on localhost —
-  search results view and qa view — over the same engine api.
+notes (
+  id                 SERIAL PRIMARY KEY,
+  title              TEXT,
+  canonical_copy_id  INTEGER   -- newest copy; the one search shows first
+);
 
-explicitly not a hosted webpage: the whole point is local-first,
-notes never leave the machine.
+copies (
+  id            SERIAL PRIMARY KEY,
+  note_id       INTEGER REFERENCES notes(id),
+  source_id     INTEGER REFERENCES sources(id),
+  external_id   TEXT,          -- id/path inside the source app
+  path          TEXT,
+  title         TEXT,
+  body          TEXT,
+  content_hash  TEXT,
+  modified_at   TIMESTAMP,
+  UNIQUE (source_id, external_id)
+);
+
+links (from_note INTEGER, to_note INTEGER);
+tags  (note_id INTEGER, tag TEXT);
+```
+
+key decision: **`notes` vs `copies` are separate tables.** three files
+in three apps = 3 rows in `copies` pointing to 1 row in `notes`.
+
+## sync
+
+one command per source, plus `--all`:
+
+```bash
+noteql sync github
+noteql sync notion
+noteql sync onedrive --folder "School/Courses"
+noteql sync --all
+```
+
+- incremental: skip a copy if its `content_hash` hasn't changed.
+- re-syncing the same file updates its row instead of adding a new one
+  (`UNIQUE (source_id, external_id)`).
+- only sync chosen folders, so random files in drive/onedrive don't
+  become publicly searchable.
+- can run by hand, on a cron, or as a github action.
+
+## duplicates
+
+two different problems:
+
+| kind | example | how |
+|---|---|---|
+| same file synced twice | re-running `sync notion` | unique key → upsert |
+| same note in different apps | docx → notion page → obsidian file | matching (below) |
+
+matching, roughly:
+
+| case | detection |
+|---|---|
+| exact copy | same `content_hash` |
+| edited copy | similar text + similar title |
+| not a copy | neither |
+
+matched copies share one `note_id`. the newest becomes canonical:
+
+```sql
+UPDATE notes SET canonical_copy_id = (
+  SELECT id FROM copies WHERE note_id = :note_id
+  ORDER BY modified_at DESC LIMIT 1
+) WHERE id = :note_id;
+```
+
+## evaluation
+
+hand-label [50–100] pairs of my own notes as "same note" / "not same"
+and measure the matcher:
+
+```
+correct:          [X] / [N]
+false matches:    [Y]
+missed matches:   [Z]
+```
+
+this number is what makes the project measurable. without it, "it
+matches duplicates" is just a claim.
 
 ## build order
 
-strict sequence, no jumping ahead:
+each step has to work end-to-end before the next.
 
-- v0: substring search over one folder. done.
-- v0.x: snippets, line numbers, case handling, tokenization.
-- v1: real inverted index on disk. own storage format for notes +
-  index. search across the whole vault, fast.
-- v2: structure-aware ranking. use metadata (folder, tags, links,
-  recency) as first-class ranking signals, not just text similarity.
-- v3: add semantic search alongside keyword (hybrid retrieval).
-  embeddings for notes, combined ranking.
-- v4: add the qa interface. retrieved notes + question → llm →
-  answer with citations. small layer on top of an already-good engine.
-- later: more sources beyond obsidian, query language, whatever
-  comes up.
+- v1: sync github (obsidian notes) into cloud postgres. basic search.
+- v2: search page on my notes website.
+- v3: second source (notion or one onedrive folder).
+- v4: cross-app matching + canonical copy. hand-label pairs, get the
+  number.
+- v5: ranking that prefers canonical copies and uses metadata (tags,
+  links, recency).
+- later: more sources, mcp server, semantic search, qa with citations.
 
-each version has to work end-to-end and be useful to me before i
-start the next one.
+## open design questions
 
-## design decisions
-
-**storage: hybrid sqlite + custom index format.** metadata lives in
-a single `notes` table in sqlite. the inverted index (posting
-lists) lives in a custom on-disk format i write myself.
-
-metadata is small, structured, relationally shaped (notes↔tags,
-notes↔links), and accessed transactionally — point lookups and
-small filtered scans. that's sqlite's design center: embedded,
-row-oriented, oltp, b-tree indexed, crash-safe. no reason to
-rebuild it.
-
-the posting-list index is custom because that's where the actual
-retrieval engineering lives, and it mirrors how real systems
-(lucene, postgres) separate metadata storage from index storage for
-different access patterns.
-
-alternatives considered:
-
-- duckdb: embedded but columnar/olap. wrong workload — we do
-  transactional row lookups, not analytical scans.
-- rocksdb / lmdb: embedded kv, but metadata is relational and
-  benefits from secondary indexes and sql. no sql either.
-- own row store for metadata: low-return work. the interesting
-  from-scratch layer is the posting-list index, not metadata
-  storage.
-- pure sqlite for everything (index via fts5): outsources the exact
-  layer this project exists to build from scratch.
-
-**incremental indexing is a v1 requirement.** the index must
-support incremental updates, not just bulk rebuild. notes get added
-and edited; unchanged notes should be skipped on re-import. this
-constrains the on-disk format from the start even if the first
-implementation is bulk-rebuild only.
-
-- change detection: content hash per note (see schema below).
-- deletions: tombstones — a deleted-id set filtered at query time,
-  plus periodic compaction / full rebuild — rather than in-place
-  edits to posting lists. lucene-style.
-- full rebuild is acceptable for v1. incremental is the design
-  target the format must not preclude.
-
-**note schema (v1, rough):**
-
-- id: stable identifier
-- path: relative path in the vault
-- title
-- tags
-- links (outbound wikilinks / md links)
-- created / modified timestamps
-- content_hash: for incremental-index change detection
-- body: raw text (or a pointer to it)
-
-## open design questions (unresolved)
-
-- record granularity: whole notes vs paragraph chunks. leaning whole
-  notes for v1 — chunking is easier to add later than to remove.
-- which metadata to index in v1: title, tags, links, path, created
-  date, modified date. probably all of these. tbd on frontmatter.
-- ranking function for v2: bm25 base + structural boosts, but the
-  weights are a real design problem.
-- language: python for now. from-scratch boundaries include
-  storage, index, query, ranking. off-limits to build myself: the
-  llm, embedding models, and (probably) the tokenizer.
+- **search: build my own index or use postgres full-text search?**
+  own index = more work, stronger database-internals story (overlaps
+  with cse 444 material: pages on disk, tombstones, caching, crash
+  safety). postgres fts = faster to ship, more time for matching.
+- **hosting:** which managed postgres. tbd.
+- **matching threshold:** how similar is "same note"? decide after
+  looking at real pairs.
+- **canonical rule:** newest by `modified_at` is the default. is
+  "most edited" or "longest" sometimes better?
+- **granularity:** whole notes for now. chunks later if search needs it.
 
 ## non-goals
 
-- multi-user support
-- distributed anything
-- web-scale
-- real-time indexing (batch is fine)
-- being a note-taking tool (obsidian is the note-taking tool)
-- being a general search engine (this is for personal knowledge
-  specifically, and design decisions assume that)
+- being a note-taking app (the apps stay the apps)
+- moving or deleting anything in the source apps
+- multi-user
+- real-time sync (batch is fine)
+- private notes / login (for now)
